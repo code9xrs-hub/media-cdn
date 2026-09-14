@@ -12,5 +12,5 @@ COPY . /app
 # Set timezone
 ENV TZ=UTC
 
-# Run long-polling runner (24/7 continuous operation without webhooks)
-CMD ["php", "poll.php"]
+# Run web server for Render health check on $PORT while running long-polling runner in parallel
+CMD sh -c "php -S 0.0.0.0:${PORT:-10000} & php poll.php"
