@@ -108,9 +108,10 @@ define('MAINTENANCE_MODE_DEFAULT', (bool)config('MAINTENANCE_MODE', false));
 // ----------------------------------------------------------------------------
 
 /**
- * Execute HTTP request to Firebase Realtime Database REST API.
+ * Execute HTTP request to Firebase Realtime Database REST API with persistent Keep-Alive connection.
  */
 function firebaseRequest(string $path, string $method = 'GET', mixed $data = null): mixed {
+    static $ch = null;
     $baseUrl = rtrim(FIREBASE_DB_URL, '/');
     $cleanPath = ltrim($path, '/');
     $url = $baseUrl . '/' . $cleanPath . '.json';
@@ -119,51 +120,87 @@ function firebaseRequest(string $path, string $method = 'GET', mixed $data = nul
         $url .= (str_contains($url, '?') ? '&' : '?') . 'auth=' . FIREBASE_API_KEY;
     }
 
-    $ch = curl_init($url);
-    $method = strtoupper($method);
+    if ($ch === null) {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 12,
+            CURLOPT_CONNECTTIMEOUT => 4,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_TCP_KEEPALIVE  => 1,
+            CURLOPT_TCP_KEEPIDLE   => 120,
+            CURLOPT_TCP_KEEPINTVL  => 60,
+        ]);
+    }
 
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $method = strtoupper($method);
+    curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
 
     if ($data !== null) {
         $payload = json_encode($data, JSON_UNESCAPED_UNICODE);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
         curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    } else {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, '');
+        curl_setopt($ch, CURLOPT_HTTPHEADER, []);
     }
 
     $raw = curl_exec($ch);
     $curlErr = curl_error($ch);
-    curl_close($ch);
 
     if ($raw === false) {
         safeLog("Firebase cURL error ($method $path): " . $curlErr);
+        // Reset socket on network error
+        curl_close($ch);
+        $ch = null;
         return null;
     }
 
-    $decoded = json_decode($raw, true);
-    return $decoded;
+    return json_decode($raw, true);
 }
 
 /**
- * Get dynamic bot setting from Firebase with fallback.
+ * Retrieve all bot settings from Firebase with in-memory caching.
+ */
+function getAllBotSettings(): array {
+    static $settingsCache = null;
+    static $lastFetch = 0;
+
+    $now = time();
+    if ($settingsCache !== null && ($now - $lastFetch) < 30) {
+        return $settingsCache;
+    }
+
+    $res = firebaseRequest('settings', 'GET');
+    if (is_array($res)) {
+        $settingsCache = $res;
+        $lastFetch = $now;
+        return $settingsCache;
+    }
+
+    return $settingsCache ?? [];
+}
+
+/**
+ * Get dynamic bot setting with zero-latency memory cache.
  */
 function getBotSetting(string $key, ?string $default = null): ?string {
-    $val = firebaseRequest("settings/{$key}", 'GET');
-    if ($val === null || (is_array($val) && empty($val))) {
-        return $default;
+    $settings = getAllBotSettings();
+    if (isset($settings[$key]) && is_scalar($settings[$key])) {
+        return (string)$settings[$key];
     }
-    return is_scalar($val) ? (string)$val : $default;
+    return $default;
 }
 
 /**
- * Set dynamic bot setting in Firebase.
+ * Set dynamic bot setting in Firebase and update memory cache.
  */
 function setBotSetting(string $key, ?string $value): bool {
     $res = firebaseRequest("settings/{$key}", 'PUT', $value ?? '');
+    $settings = getAllBotSettings();
+    $settings[$key] = $value ?? '';
     return ($res !== null);
 }
 
@@ -285,18 +322,26 @@ function getOrCreateUser(array $tgUser): ?array {
     $existing = firebaseRequest("users/{$tgId}", 'GET');
 
     if (is_array($existing) && !empty($existing['telegram_user_id'])) {
-        // Update profile if changed
-        $updated = [
-            'username'   => $username,
-            'first_name' => $firstName,
-            'last_name'  => $lastName,
-            'updated_at' => date('Y-m-d H:i:s')
-        ];
-        firebaseRequest("users/{$tgId}", 'PATCH', $updated);
+        // Only update profile in Firebase if fields actually changed (avoids redundant network latency)
+        $needsUpdate = (
+            ($existing['username'] ?? null) !== $username ||
+            ($existing['first_name'] ?? null) !== $firstName ||
+            ($existing['last_name'] ?? null) !== $lastName
+        );
 
-        $existing['username'] = $username;
-        $existing['first_name'] = $firstName;
-        $existing['last_name'] = $lastName;
+        if ($needsUpdate) {
+            $updated = [
+                'username'   => $username,
+                'first_name' => $firstName,
+                'last_name'  => $lastName,
+                'updated_at' => date('Y-m-d H:i:s')
+            ];
+            firebaseRequest("users/{$tgId}", 'PATCH', $updated);
+            $existing['username'] = $username;
+            $existing['first_name'] = $firstName;
+            $existing['last_name'] = $lastName;
+        }
+
         $existing['is_new'] = false;
         return $existing;
     }
@@ -533,27 +578,36 @@ function vidmolyRequest(string $endpoint, array $params = [], string $method = '
  * Send request to Telegram Bot API.
  */
 function telegramRequest(string $method, array $params = []): ?array {
+    static $ch = null;
     $url = 'https://api.telegram.org/bot' . BOT_TOKEN . '/' . $method;
 
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => json_encode($params),
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_TIMEOUT        => 20,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-    ]);
+    if ($ch === null) {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_CONNECTTIMEOUT => 4,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_TCP_KEEPALIVE  => 1,
+            CURLOPT_TCP_KEEPIDLE   => 120,
+            CURLOPT_TCP_KEEPINTVL  => 60,
+        ]);
+    }
+
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($params, JSON_UNESCAPED_UNICODE));
 
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $curlErr = curl_error($ch);
-    curl_close($ch);
 
     if ($response === false) {
         safeLog("Telegram API error ($method): $curlErr");
+        curl_close($ch);
+        $ch = null;
         return null;
     }
 
@@ -598,6 +652,19 @@ function editTelegramMessage(int|string $chatId, int $messageId, string $text, ?
 }
 
 /**
+ * Send new message or edit existing message in-place if message_id is provided.
+ */
+function sendOrEditTelegramMessage(int|string $chatId, ?int $messageId, string $text, ?array $keyboard = null, string $parseMode = 'HTML'): ?array {
+    if ($messageId !== null) {
+        $res = editTelegramMessage($chatId, $messageId, $text, $keyboard, $parseMode);
+        if ($res !== null && !empty($res['ok'])) {
+            return $res;
+        }
+    }
+    return sendTelegramMessage($chatId, $text, $keyboard, $parseMode);
+}
+
+/**
  * Answer Telegram callback query.
  */
 function answerCallbackQuery(string $callbackQueryId, string $text = '', bool $showAlert = false): void {
@@ -616,6 +683,33 @@ function sendChatAction(int|string $chatId, string $action = 'typing'): void {
         'chat_id' => $chatId,
         'action'  => $action
     ]);
+}
+
+/**
+ * Format copyable video links (stream).
+ */
+function formatVideoLinks(string $fileCode, string $title = '', ?int $fileSize = null, string $lang = 'en'): string {
+    $embedUrl = "https://vidmoly.org/embed-{$fileCode}.html";
+
+    $sizeText = ($fileSize && $fileSize > 0) ? " | 💾 " . round($fileSize / (1024 * 1024), 2) . " MB" : "";
+    $titleText = ($title !== '') ? "🎬 <b>Title:</b> " . htmlspecialchars($title) . "\n" : "";
+
+    if ($lang === 'bn') {
+        return "{$titleText}"
+             . "🆔 <b>ফাইল কোড:</b> <code>{$fileCode}</code>{$sizeText}\n\n"
+             . "📺 <b>Stream:</b> <i>(কপি করতে ট্যাপ করুন)</i>\n"
+             . "<code>{$embedUrl}</code>";
+    } elseif ($lang === 'hi') {
+        return "{$titleText}"
+             . "🆔 <b>फाइल कोड:</b> <code>{$fileCode}</code>{$sizeText}\n\n"
+             . "📺 <b>Stream:</b> <i>(कॉपी करने के लिए टैप करें)</i>\n"
+             . "<code>{$embedUrl}</code>";
+    }
+
+    return "{$titleText}"
+         . "🆔 <b>File Code:</b> <code>{$fileCode}</code>{$sizeText}\n\n"
+         . "📺 <b>Stream:</b> <i>(Tap to copy)</i>\n"
+         . "<code>{$embedUrl}</code>";
 }
 
 /**
@@ -647,7 +741,7 @@ function checkUserSubscription(int|string $telegramUserId): bool {
 /**
  * Render Force Subscribe Required Alert.
  */
-function sendForceSubscribeNotice(int|string $chatId, string $lang = 'en'): void {
+function sendForceSubscribeNotice(int|string $chatId, string $lang = 'en', ?int $messageId = null): void {
     $channel = trim((string)getBotSetting('force_sub_channel', ''));
     $channelLink = str_starts_with($channel, '@') ? 'https://t.me/' . substr($channel, 1) : 'https://t.me/' . ltrim($channel, '@');
 
@@ -678,7 +772,7 @@ function sendForceSubscribeNotice(int|string $chatId, string $lang = 'en'): void
         ]
     ];
 
-    sendTelegramMessage($chatId, $t['msg'], $keyboard);
+    sendOrEditTelegramMessage($chatId, $messageId, $t['msg'], $keyboard);
 }
 
 // ----------------------------------------------------------------------------
@@ -705,45 +799,27 @@ function buildMainMenuKeyboard(string $lang = 'en'): array {
     $btn = [
         'en' => [
             'upload'  => '📤 Upload Video',
-            'remote'  => '🌐 Remote Upload',
             'files'   => '📁 My Files',
-            'finfo'   => '🔎 File Info',
+            'account' => '👤 Account',
             'apis'    => '🔑 My APIs',
-            'addapi'  => '➕ Add API',
-            'switch'  => '🔄 Switch API',
-            'remove'  => '🗑️ Remove API',
-            'account' => '👤 Account Info',
-            'stats'   => '📊 Statistics',
             'folders' => '📂 Folders',
             'lang'    => '🌐 Language',
             'help'    => '❓ User Guide'
         ],
         'bn' => [
             'upload'  => '📤 ভিডিও আপলোড',
-            'remote'  => '🌐 রিমোট আপলোড',
             'files'   => '📁 আমার ফাইলসমূহ',
-            'finfo'   => '🔎 ফাইল তথ্য',
+            'account' => '👤 অ্যাকাউন্ট',
             'apis'    => '🔑 সংরক্ষিত API',
-            'addapi'  => '➕ API যোগ করুন',
-            'switch'  => '🔄 API পরিবর্তন',
-            'remove'  => '🗑️ API মুছুন',
-            'account' => '👤 অ্যাকাউন্ট তথ্য',
-            'stats'   => '📊 পরিসংখ্যান',
             'folders' => '📂 ফোল্ডারসমূহ',
             'lang'    => '🌐 ভাষা পরিবর্তন',
-            'help'    => '❓ সহায়িকা ও গাইড'
+            'help'    => '❓ সহায়িকা'
         ],
         'hi' => [
             'upload'  => '📤 वीडियो अपलोड',
-            'remote'  => '🌐 रिमोट अपलोड',
             'files'   => '📁 मेरी फाइलें',
-            'finfo'   => '🔎 फाइल विवरण',
-            'apis'    => '🔑 मेरी API',
-            'addapi'  => '➕ API जोड़ें',
-            'switch'  => '🔄 API बदलें',
-            'remove'  => '🗑️ API हटाएं',
             'account' => '👤 खाता विवरण',
-            'stats'   => '📊 आंकड़े',
+            'apis'    => '🔑 मेरी API',
             'folders' => '📂 फ़ोल्डर्स',
             'lang'    => '🌐 भाषा बदलें',
             'help'    => '❓ सहायता गाइड'
@@ -756,23 +832,11 @@ function buildMainMenuKeyboard(string $lang = 'en'): array {
         'inline_keyboard' => [
             [
                 ['text' => $b['upload'], 'callback_data' => 'menu_upload'],
-                ['text' => $b['remote'], 'callback_data' => 'menu_remote_upload']
-            ],
-            [
-                ['text' => $b['files'], 'callback_data' => 'menu_files'],
-                ['text' => $b['finfo'], 'callback_data' => 'menu_file_info']
-            ],
-            [
-                ['text' => $b['apis'], 'callback_data' => 'menu_apis'],
-                ['text' => $b['addapi'], 'callback_data' => 'api_add']
-            ],
-            [
-                ['text' => $b['switch'], 'callback_data' => 'api_switch'],
-                ['text' => $b['remove'], 'callback_data' => 'api_remove']
+                ['text' => $b['files'], 'callback_data' => 'menu_files']
             ],
             [
                 ['text' => $b['account'], 'callback_data' => 'menu_account'],
-                ['text' => $b['stats'], 'callback_data' => 'menu_stats']
+                ['text' => $b['apis'], 'callback_data' => 'menu_apis']
             ],
             [
                 ['text' => $b['folders'], 'callback_data' => 'menu_folders'],
@@ -808,23 +872,23 @@ function buildBackToMenuKeyboard(string $lang = 'en'): array {
 /**
  * Prompt user to select language.
  */
-function handleLanguageSelectionPrompt(int|string $chatId): void {
+function handleLanguageSelectionPrompt(int|string $chatId, ?int $messageId = null): void {
     $text = "🌐 <b>Select Your Preferred Language / আপনার ভাষা নির্বাচন করুন / अपनी भाषा चुनें:</b>\n\n"
           . "🇬🇧 <b>English:</b> Default international language.\n"
           . "🇧🇩 <b>বাংলা (Bangla):</b> সম্পূর্ণ বাংলা ইন্টারফেস ও গাইড।\n"
           . "🇮🇳 <b>हिन्दी (Hindi):</b> पूर्ण हिंदी इंटरफ़ेस और गाइड।\n\n"
           . "👇 <i>Tap one of the buttons below to choose:</i>";
 
-    sendTelegramMessage($chatId, $text, buildLanguageSelectionKeyboard());
+    sendOrEditTelegramMessage($chatId, $messageId, $text, buildLanguageSelectionKeyboard());
 }
 
 /**
  * Handle /start command.
  */
-function handleStartCommand(array $user, int|string $chatId): void {
+function handleStartCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     if (!empty($user['is_new'])) {
         setUserState($user['id'], 'selecting_language');
-        handleLanguageSelectionPrompt($chatId);
+        handleLanguageSelectionPrompt($chatId, $messageId);
         return;
     }
 
@@ -858,13 +922,13 @@ function handleStartCommand(array $user, int|string $chatId): void {
               . "👇 <b>Select an option from the menu below:</b>";
     }
 
-    sendTelegramMessage($chatId, $text, buildMainMenuKeyboard($lang));
+    sendOrEditTelegramMessage($chatId, $messageId, $text, buildMainMenuKeyboard($lang));
 }
 
 /**
  * Handle /help command.
  */
-function handleHelpCommand(int|string $chatId, string $lang = 'en'): void {
+function handleHelpCommand(int|string $chatId, string $lang = 'en', ?int $messageId = null): void {
     if ($lang === 'bn') {
         $text = "📖 <b>Vidmoly Bot — সম্পূর্ণ কমান্ড সহায়িকা ও ইউজার গাইড</b>\n\n"
               . "<b>🔑 API ব্যবস্থাপনা কমান্ড:</b>\n"
@@ -933,13 +997,13 @@ function handleHelpCommand(int|string $chatId, string $lang = 'en'): void {
               . "• /cancel — <i>Abort current operation anytime.</i>";
     }
 
-    sendTelegramMessage($chatId, $text, buildBackToMenuKeyboard($lang));
+    sendOrEditTelegramMessage($chatId, $messageId, $text, buildBackToMenuKeyboard($lang));
 }
 
 /**
  * Handle /addapi command.
  */
-function handleAddApiCommand(array $user, int|string $chatId): void {
+function handleAddApiCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     $lang = $user['language'] ?: 'en';
     $apis = getUserApis($user['id']);
     $maxApis = (int)getBotSetting('max_apis_per_user', (string)MAX_APIS_PER_USER);
@@ -950,7 +1014,7 @@ function handleAddApiCommand(array $user, int|string $chatId): void {
             'bn' => "⚠️ <b>API সীমা পূর্ণ হয়েছে</b>\nআপনি ইতিমধ্যে সর্বোচ্চ {$maxApis} টি API কী যুক্ত করেছেন। নতুন কী যোগ করতে /removeapi দিয়ে অব্যবহৃত কী মুছুন।",
             'hi' => "⚠️ <b>API सीमा समाप्त</b>\nआप पहले ही अधिकतम {$maxApis} API कुंजियां जोड़ चुके हैं। नई कुंजी जोड़ने के लिए /removeapi का उपयोग करें।"
         ];
-        sendTelegramMessage($chatId, $msgs[$lang] ?? $msgs['en'], buildBackToMenuKeyboard($lang));
+        sendOrEditTelegramMessage($chatId, $messageId, $msgs[$lang] ?? $msgs['en'], buildBackToMenuKeyboard($lang));
         return;
     }
 
@@ -997,7 +1061,7 @@ function handleAddApiCommand(array $user, int|string $chatId): void {
             [['text' => $cancelBtn[$lang] ?? $cancelBtn['en'], 'callback_data' => 'menu_main']]
         ]
     ];
-    sendTelegramMessage($chatId, $text, $keyboard);
+    sendOrEditTelegramMessage($chatId, $messageId, $text, $keyboard);
 }
 
 /**
@@ -1428,11 +1492,11 @@ function handleStatsCommand(array $user, int|string $chatId, ?int $messageId = n
 /**
  * Handle /upload command.
  */
-function handleUploadCommand(array $user, int|string $chatId): void {
+function handleUploadCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     $lang = $user['language'] ?: 'en';
     $activeApi = getActiveApi($user['id']);
     if (!$activeApi) {
-        handleMyApis($user, $chatId);
+        handleMyApis($user, $chatId, $messageId);
         return;
     }
 
@@ -1459,14 +1523,11 @@ function handleUploadCommand(array $user, int|string $chatId): void {
               . "👉 <b>अब सीधा वीडियो यूआरएल भेजें:</b>\n"
               . "<i>(रद्द करने के लिए /cancel टाइप करें)</i>";
     } else {
-        $text = "🌐 <b>Remote URL Upload — User Guide</b>\n\n"
-              . "<b>How Remote Upload works:</b>\n"
-              . "1. Obtain a direct public video link.\n"
-              . "2. Supported protocols: <code>http://</code> or <code>https://</code>\n"
-              . "3. Supported formats: <code>.mp4</code>, <code>.mkv</code>, <code>.webm</code>, <code>.avi</code>\n"
-              . "4. Example link format:\n"
-              . "   <code>https://example.com/videos/sample.mp4</code>\n\n"
-              . "👉 <b>Please send the video URL now:</b>\n"
+        $text = "🌐 <b>Video Upload — Quick Guide</b>\n\n"
+              . "<b>How to upload:</b>\n"
+              . "1. Send a direct video URL (HTTP/HTTPS)\n"
+              . "2. Or send / forward any video file directly to this bot!\n\n"
+              . "👉 <b>Please send the video URL or video file now:</b>\n"
               . "<i>(Type /cancel to abort at any time)</i>";
     }
 
@@ -1476,7 +1537,7 @@ function handleUploadCommand(array $user, int|string $chatId): void {
             [['text' => $cancelBtn[$lang] ?? $cancelBtn['en'], 'callback_data' => 'menu_main']]
         ]
     ];
-    sendTelegramMessage($chatId, $text, $keyboard);
+    sendOrEditTelegramMessage($chatId, $messageId, $text, $keyboard);
 }
 
 /**
@@ -1550,37 +1611,51 @@ function handleProcessRemoteUrl(array $user, int|string $chatId, string $url): v
 
     clearUserState($user['id']);
 
-    $codeText = $fileCode ? "🆔 <b>File Code:</b> <code>{$fileCode}</code>\n" : "";
+    if ($fileCode) {
+        $linksText = formatVideoLinks($fileCode, '', null, $lang);
+        if ($lang === 'bn') {
+            $text = "✅ <b>রিমোট আপলোড সফলভাবে যুক্ত হয়েছে!</b>\n\n"
+                  . $linksText . "\n\n"
+                  . "⏳ <i>Vidmoly ব্যাকগ্রাউন্ডে ভিডিও ডাউনলোড করছে। সম্পন্ন হলে স্ট্রিমিং লিঙ্ক চালু হবে।</i>";
+        } elseif ($lang === 'hi') {
+            $text = "✅ <b>रिमोट अपलोड सफलतापूर्वक जोड़ा गया!</b>\n\n"
+                  . $linksText . "\n\n"
+                  . "⏳ <i>Vidmoly पृष्ठभूमि में वीडियो डाउनलोड कर रहा है। पूर्ण होने पर स्ट्रीमिंग सक्रिय हो जाएगी।</i>";
+        } else {
+            $text = "✅ <b>Remote Upload Successfully Queued!</b>\n\n"
+                  . $linksText . "\n\n"
+                  . "⏳ <i>Vidmoly is downloading and processing the video in the background.</i>";
+        }
 
-    if ($lang === 'bn') {
-        $text = "✅ <b>রিমোট আপলোড সফলভাবে কিউতে যুক্ত হয়েছে!</b>\n\n"
-              . "🔗 <b>লিঙ্ক:</b> <code>" . htmlspecialchars(substr($url, 0, 50)) . "...</code>\n"
-              . $codeText
-              . "⏳ Vidmoly ব্যাকগ্রাউন্ডে ভিডিও ডাউনলোড ও রূপান্তর করছে। সম্পন্ন হলে /files এ পাওয়া যাবে।";
-    } elseif ($lang === 'hi') {
-        $text = "✅ <b>रिमोट अपलोड सफलतापूर्वक कतार में जोड़ा गया!</b>\n\n"
-              . "🔗 <b>लिंक:</b> <code>" . htmlspecialchars(substr($url, 0, 50)) . "...</code>\n"
-              . $codeText
-              . "⏳ Vidmoly पृष्ठभूमि में वीडियो डाउनलोड और प्रोसेस कर रहा है। पूर्ण होने पर /files में दिखाई देगा।";
+        $embedUrl = "https://vidmoly.org/embed-{$fileCode}.html";
+        $keyboard = [
+            'inline_keyboard' => [
+                [['text' => '▶️ Stream Video', 'url' => $embedUrl]],
+                [
+                    ['text' => '📁 View My Files', 'callback_data' => 'menu_files'],
+                    ['text' => '📤 Upload Another', 'callback_data' => 'menu_remote_upload']
+                ],
+                [['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']]
+            ]
+        ];
     } else {
-        $text = "✅ <b>Remote Upload Successfully Queued!</b>\n\n"
-              . "🔗 <b>Source URL:</b> <code>" . htmlspecialchars(substr($url, 0, 50)) . "...</code>\n"
-              . $codeText
-              . "⏳ Vidmoly is downloading and processing the video in the background. Check /files once completed.";
+        $text = "✅ <b>Remote Upload Queued!</b>\n\n"
+              . "🔗 <b>Source URL:</b> <code>" . htmlspecialchars(substr($url, 0, 50)) . "...</code>\n\n"
+              . "⏳ Vidmoly is downloading the video. Check /files once completed.";
+        $vfBtn = ['en' => '📁 View My Files', 'bn' => '📁 আমার ফাইলসমূহ', 'hi' => '📁 मेरी फाइलें'];
+        $keyboard = [
+            'inline_keyboard' => [
+                [['text' => $vfBtn[$lang] ?? $vfBtn['en'], 'callback_data' => 'menu_files']],
+                [['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']]
+            ]
+        ];
     }
 
-    $vfBtn = ['en' => '📁 View My Files', 'bn' => '📁 আমার ফাইলসমূহ', 'hi' => '📁 मेरी फाइलें'];
-    $keyboard = [
-        'inline_keyboard' => [
-            [['text' => $vfBtn[$lang] ?? $vfBtn['en'], 'callback_data' => 'menu_files']],
-            [['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']]
-        ]
-    ];
     sendTelegramMessage($chatId, $text, $keyboard);
 }
 
 /**
- * Handle incoming direct Telegram Video / Document.
+ * Handle incoming direct Telegram Video / Document / Forwarded video.
  */
 function handleDirectTelegramUpload(array $user, int|string $chatId, array $message): void {
     $lang = $user['language'] ?: 'en';
@@ -1592,44 +1667,62 @@ function handleDirectTelegramUpload(array $user, int|string $chatId, array $mess
 
     $videoObj = $message['video'] ?? null;
     $docObj = $message['document'] ?? null;
+    $animObj = $message['animation'] ?? null;
 
-    $fileId = $videoObj['file_id'] ?? $docObj['file_id'] ?? null;
-    $uniqueId = $videoObj['file_unique_id'] ?? $docObj['file_unique_id'] ?? null;
-    $fileName = $videoObj['file_name'] ?? $docObj['file_name'] ?? 'telegram_video_' . time() . '.mp4';
-    $fileSize = $videoObj['file_size'] ?? $docObj['file_size'] ?? 0;
+    $fileId = $videoObj['file_id'] ?? $docObj['file_id'] ?? $animObj['file_id'] ?? null;
+    $uniqueId = $videoObj['file_unique_id'] ?? $docObj['file_unique_id'] ?? $animObj['file_unique_id'] ?? null;
+    $fileName = $videoObj['file_name'] ?? $docObj['file_name'] ?? null;
+    $caption = trim($message['caption'] ?? '');
+    if (!$fileName) {
+        $fileName = !empty($caption) ? substr($caption, 0, 40) . '.mp4' : ('telegram_video_' . time() . '.mp4');
+    }
+    $fileSize = $videoObj['file_size'] ?? $docObj['file_size'] ?? $animObj['file_size'] ?? 0;
 
     if (!$fileId) {
         sendTelegramMessage($chatId, "❌ File could not be identified.");
         return;
     }
 
-    sendChatAction($chatId, 'upload_video');
-    sendTelegramMessage($chatId, "⏳ <b>Processing:</b> <code>" . htmlspecialchars($fileName) . "</code>\nContacting Vidmoly gateway...");
-
-    $serverRes = vidmolyRequest('/api/upload/server', [], 'GET', $activeApi['decrypted_key']);
-
-    if (!$serverRes['success']) {
-        sendTelegramMessage($chatId, "❌ Vidmoly upload server unavailable: " . htmlspecialchars($serverRes['message'] ?: 'Failed'), buildMainMenuKeyboard($lang));
-        return;
-    }
-
-    $uploadServerUrl = $serverRes['result'] ?? $serverRes['data']['result'] ?? null;
-
-    if (empty($uploadServerUrl) || !is_string($uploadServerUrl)) {
-        $notice = [
-            'en' => "ℹ️ <b>Direct Upload Protocol Notice</b>\nVidmoly did not return a multipart push URL.\n💡 <b>Tip:</b> Please use /upload with a direct video URL for guaranteed high speed!",
-            'bn' => "ℹ️ <b>সরাসরি আপলোড নোটিস</b>\nVidmoly সরাসরি ফাইল আপলোড গেটওয়ে দেয়নি।\n💡 <b>টিপ:</b> দ্রুততম ও নির্ভরযোগ্য আপলোডের জন্য /upload দিয়ে ডাইরেক্ট ভিডিও লিঙ্ক পাঠান!",
-            'hi' => "ℹ️ <b>डायरेक्ट अपलोड सूचना</b>\nVidmoly ने डायरेक्ट अपलोड गेटवे नहीं दिया।\n💡 <b>सुझाव:</b> बेहतरीन गति के लिए कृपया /upload का उपयोग करके डायरेक्ट वीडियो लिंक भेजें!"
+    // Telegram Bot API limits direct getFile downloads to 20MB
+    if ($fileSize > 20 * 1024 * 1024) {
+        $mbSize = round($fileSize / (1024 * 1024), 1);
+        $oversizeMsg = [
+            'en' => "⚠️ <b>File Exceeds Telegram Bot Limit ({$mbSize} MB)</b>\n\n"
+                  . "Telegram Bot API restricts direct bot downloads to <b>20 MB</b> max.\n\n"
+                  . "💡 <b>How to upload this video:</b>\n"
+                  . "1. Upload your file to Google Drive, Dropbox, Mega, or any direct link.\n"
+                  . "2. Send the URL directly to this bot!\n\n"
+                  . "⚡ <i>Vidmoly Remote Upload supports unlimited file sizes at gigabit speeds!</i>",
+            'bn' => "⚠️ <b>ফাইলটি টেলিগ্রাম বট সীমার চেয়ে বড় ({$mbSize} MB)</b>\n\n"
+                  . "টেলিগ্রাম বট এপিআই সরাসরি সর্বোচ্চ <b>২০ মেগাবাইট (20 MB)</b> ফাইল ডাউনলোডের অনুমতি দেয়।\n\n"
+                  . "💡 <b>কীভাবে ভিডিও আপলোড করবেন:</b>\n"
+                  . "১. ফাইলটি গুগল ড্রাইভ, ড্রপবক্স বা যেকোনো সাইটে আপলোড করুন।\n"
+                  . "২. সরাসরি ডাউনলোড লিঙ্কটি এই বটে পাঠান!\n\n"
+                  . "⚡ <i>রিমোট আপলোডের মাধ্যমে আনলিমিটেড সাইজের ভিডিও দ্রুত আপলোড করা যায়!</i>",
+            'hi' => "⚠️ <b>फाइल टेलीग्राम बॉट सीमा से बड़ी है ({$mbSize} MB)</b>\n\n"
+                  . "टेलीग्राम बॉट एपीआई केवल अधिकतम <b>20 MB</b> तक की फाइलों को सीधे डाउनलोड करने की अनुमति देता है।\n\n"
+                  . "💡 <b>इस वीडियो को कैसे अपलोड करें:</b>\n"
+                  . "1. अपनी फाइल को गूगल ड्राइव, ड्रॉपबॉक्स या किसी डायरेक्ट होस्ट पर अपलोड करें।\n"
+                  . "2. डायरेक्ट लिंक इस बॉट को भेजें!\n\n"
+                  . "⚡ <i>रिमोट अपलोड के माध्यम से असीमित आकार की वीडियो सुपरफ़ास्ट गति से अपलोड होती है!</i>"
         ];
-        sendTelegramMessage($chatId, $notice[$lang] ?? $notice['en'], buildMainMenuKeyboard($lang));
+        sendTelegramMessage($chatId, $oversizeMsg[$lang] ?? $oversizeMsg['en'], buildMainMenuKeyboard($lang));
         return;
     }
+
+    sendChatAction($chatId, 'upload_video');
+    $procMsg = [
+        'en' => "⏳ <b>Processing Video:</b> <code>" . htmlspecialchars($fileName) . "</code>\nImporting to Vidmoly...",
+        'bn' => "⏳ <b>ভিডিও প্রসেসিং:</b> <code>" . htmlspecialchars($fileName) . "</code>\nVidmoly-তে পাঠানো হচ্ছে...",
+        'hi' => "⏳ <b>वीडियो प्रोसेसिंग:</b> <code>" . htmlspecialchars($fileName) . "</code>\nVidmoly में भेजा जा रहा है..."
+    ];
+    sendTelegramMessage($chatId, $procMsg[$lang] ?? $procMsg['en']);
 
     $tgFileRes = telegramRequest('getFile', ['file_id' => $fileId]);
     $filePath = $tgFileRes['result']['file_path'] ?? null;
 
     if (!$filePath) {
-        sendTelegramMessage($chatId, "❌ File exceeds Telegram Bot 20MB limit. Use /upload for large files.");
+        sendTelegramMessage($chatId, "❌ Failed to retrieve file from Telegram servers.", buildMainMenuKeyboard($lang));
         return;
     }
 
@@ -1653,22 +1746,46 @@ function handleDirectTelegramUpload(array $user, int|string $chatId, array $mess
             'created_at'              => date('Y-m-d H:i:s')
         ]);
 
-        $codeText = $fileCode ? "🆔 <b>File Code:</b> <code>{$fileCode}</code>\n" : "";
-        $text = "✅ <b>Upload Initiated!</b>\n\n"
-              . "🎬 <b>File:</b> " . htmlspecialchars($fileName) . "\n"
-              . $codeText
-              . "📊 <b>Size:</b> " . round($fileSize / (1024 * 1024), 2) . " MB\n\n"
-              . "⏳ Vidmoly is importing the file. Check /files once finished.";
+        if ($fileCode) {
+            $linksText = formatVideoLinks($fileCode, $fileName, $fileSize, $lang);
+            if ($lang === 'bn') {
+                $text = "✅ <b>ভিডিও সফলভাবে আপলোড হয়েছে!</b>\n\n"
+                      . $linksText . "\n\n"
+                      . "⏳ <i>Vidmoly ব্যাকগ্রাউন্ডে ভিডিও প্রস্তুত করছে।</i>";
+            } elseif ($lang === 'hi') {
+                $text = "✅ <b>वीडियो सफलतापूर्वक अपलोड हो गया!</b>\n\n"
+                      . $linksText . "\n\n"
+                      . "⏳ <i>Vidmoly वीडियो प्रोसेस कर रहा है।</i>";
+            } else {
+                $text = "✅ <b>Video Uploaded Successfully!</b>\n\n"
+                      . $linksText . "\n\n"
+                      . "⏳ <i>Vidmoly is processing the video in the background.</i>";
+            }
 
-        $keyboard = [
-            'inline_keyboard' => [
-                [['text' => '📁 View Files', 'callback_data' => 'menu_files']],
-                [['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']]
-            ]
-        ];
+            $embedUrl = "https://vidmoly.org/embed-{$fileCode}.html";
+            $keyboard = [
+                'inline_keyboard' => [
+                    [['text' => '▶️ Stream Video', 'url' => $embedUrl]],
+                    [['text' => '📁 View My Files', 'callback_data' => 'menu_files']],
+                    [['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']]
+                ]
+            ];
+        } else {
+            $text = "✅ <b>Upload Initiated!</b>\n\n"
+                  . "🎬 <b>File:</b> " . htmlspecialchars($fileName) . "\n"
+                  . "📊 <b>Size:</b> " . round($fileSize / (1024 * 1024), 2) . " MB\n\n"
+                  . "⏳ Vidmoly is importing the file. Check /files once finished.";
+            $keyboard = [
+                'inline_keyboard' => [
+                    [['text' => '📁 View Files', 'callback_data' => 'menu_files']],
+                    [['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']]
+                ]
+            ];
+        }
+
         sendTelegramMessage($chatId, $text, $keyboard);
     } else {
-        sendTelegramMessage($chatId, "❌ Upload error: " . htmlspecialchars($remoteUploadRes['message'] ?: 'Failed'), buildMainMenuKeyboard($lang));
+        sendTelegramMessage($chatId, "❌ Upload error: " . htmlspecialchars($remoteUploadRes['message'] ?: 'Failed to upload file to Vidmoly'), buildMainMenuKeyboard($lang));
     }
 }
 
@@ -1758,12 +1875,12 @@ function handleFilesCommand(array $user, int|string $chatId, ?int $messageId = n
 /**
  * Handle /fileinfo command or button.
  */
-function handleFileInfoCommand(array $user, int|string $chatId, ?string $fileCode = null): void {
+function handleFileInfoCommand(array $user, int|string $chatId, ?string $fileCode = null, ?int $messageId = null): void {
     $lang = $user['language'] ?: 'en';
     if (empty($fileCode)) {
         setUserState($user['id'], 'waiting_file_code');
         $p = [
-            'en' => "🔎 <b>File Information — User Guide</b>\n\nSend the <b>File Code</b> of the video you want to inspect (e.g. <code>abc123xyz</code>).\n<i>(Find codes using /files or in vidmoly.me/w/CODE link)</i>\nType /cancel to abort.",
+            'en' => "🔎 <b>File Information — User Guide</b>\n\nSend the <b>File Code</b> of the video you want to inspect (e.g. <code>abc123xyz</code>).\n<i>(Find codes using /files or in stream embed link)</i>\nType /cancel to abort.",
             'bn' => "🔎 <b>ফাইল তথ্য — ইউজার গাইড</b>\n\nযে ভিডিওর তথ্য দেখতে চান তার <b>File Code</b> লিখে পাঠান (যেমন: <code>abc123xyz</code>)।\n<i>(কোড দেখতে /files কমান্ড দিন)</i>\nবাতিল করতে /cancel লিখুন।",
             'hi' => "🔎 <b>फाइल विवरण — गाइड</b>\n\nजिस वीडियो की जानकारी देखना चाहते हैं उसका <b>File Code</b> भेजें (उदा: <code>abc123xyz</code>)।\n<i>(कोड देखने के लिए /files का उपयोग करें)</i>\nरद्द करने के लिए /cancel टाइप करें।"
         ];
@@ -1773,13 +1890,13 @@ function handleFileInfoCommand(array $user, int|string $chatId, ?string $fileCod
                 [['text' => $cBtn[$lang] ?? $cBtn['en'], 'callback_data' => 'menu_main']]
             ]
         ];
-        sendTelegramMessage($chatId, $p[$lang] ?? $p['en'], $keyboard);
+        sendOrEditTelegramMessage($chatId, $messageId, $p[$lang] ?? $p['en'], $keyboard);
         return;
     }
 
     $activeApi = getActiveApi($user['id']);
     if (!$activeApi) {
-        sendTelegramMessage($chatId, "⚠️ No active Vidmoly API connected.");
+        sendOrEditTelegramMessage($chatId, $messageId, "⚠️ No active Vidmoly API connected.", buildMainMenuKeyboard($lang));
         return;
     }
 
@@ -1791,7 +1908,7 @@ function handleFileInfoCommand(array $user, int|string $chatId, ?string $fileCod
     $res = vidmolyRequest('/api/file/info', ['file_code' => $firstCode], 'GET', $activeApi['decrypted_key']);
 
     if (!$res['success']) {
-        sendTelegramMessage($chatId, "❌ <b>File Not Found:</b> " . htmlspecialchars($res['message'] ?: 'Invalid code'));
+        sendOrEditTelegramMessage($chatId, $messageId, "❌ <b>File Not Found:</b> " . htmlspecialchars($res['message'] ?: 'Invalid code'), buildBackToMenuKeyboard($lang));
         return;
     }
 
@@ -1800,40 +1917,43 @@ function handleFileInfoCommand(array $user, int|string $chatId, ?string $fileCod
         $result = $result[0];
     }
 
-    $title = $result['title'] ?? 'Untitled';
+    $title = $result['title'] ?? 'Untitled Video';
     $code = $result['file_code'] ?? $firstCode;
     $status = $result['status'] ?? 'Active';
-    $size = isset($result['size']) ? round($result['size'] / (1024 * 1024), 2) . ' MB' : 'N/A';
+    $rawSize = isset($result['size']) ? (int)$result['size'] : null;
+    $size = $rawSize ? round($rawSize / (1024 * 1024), 2) . ' MB' : 'N/A';
     $views = $result['views'] ?? 0;
     $uploaded = $result['uploaded'] ?? $result['created'] ?? 'N/A';
-    $watchUrl = "https://vidmoly.me/w/" . $code;
+    $embedUrl = "https://vidmoly.org/embed-{$code}.html";
 
     $text = "🎬 <b>Video File Details</b>\n\n"
           . "📌 <b>Title:</b> " . htmlspecialchars($title) . "\n"
           . "🆔 <b>File Code:</b> <code>{$code}</code>\n"
-          . "📊 <b>Status:</b> " . htmlspecialchars($status) . "\n"
-          . "💾 <b>Size:</b> {$size}\n"
-          . "👁 <b>Views:</b> " . number_format($views) . "\n"
-          . "📅 <b>Uploaded:</b> " . htmlspecialchars($uploaded) . "\n\n"
-          . "📺 <b>Watch URL:</b> <a href=\"{$watchUrl}\">{$watchUrl}</a>";
+          . "📊 <b>Status:</b> " . htmlspecialchars($status) . " | 👁 <b>Views:</b> " . number_format($views) . "\n"
+          . "💾 <b>Size:</b> {$size} | 📅 <b>Uploaded:</b> " . htmlspecialchars($uploaded) . "\n\n"
+          . "📺 <b>Stream:</b> <i>(Tap to copy)</i>\n"
+          . "<code>{$embedUrl}</code>";
 
     $keyboard = [
         'inline_keyboard' => [
             [
-                ['text' => '▶️ Open in Browser', 'url' => $watchUrl],
-                ['text' => '✏️ Rename Title', 'callback_data' => 'frename_' . $code]
+                ['text' => '▶️ Stream Video', 'url' => $embedUrl],
+                ['text' => '✏️ Rename', 'callback_data' => 'frename_' . $code]
             ],
-            [['text' => '📁 Back to Files', 'callback_data' => 'menu_files']]
+            [
+                ['text' => '📁 Back to Files', 'callback_data' => 'menu_files'],
+                ['text' => buildBackToMenuKeyboard($lang)['inline_keyboard'][0][0]['text'], 'callback_data' => 'menu_main']
+            ]
         ]
     ];
 
-    sendTelegramMessage($chatId, $text, $keyboard);
+    sendOrEditTelegramMessage($chatId, $messageId, $text, $keyboard);
 }
 
 /**
  * Handle /rename command.
  */
-function handleRenameCommand(array $user, int|string $chatId): void {
+function handleRenameCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     $lang = $user['language'] ?: 'en';
     setUserState($user['id'], 'waiting_rename_code');
     $p = [
@@ -1842,7 +1962,7 @@ function handleRenameCommand(array $user, int|string $chatId): void {
         'hi' => "✏️ <b>वीडियो नाम बदलें — गाइड</b>\n\nचरण 1: जिस वीडियो का नाम बदलना चाहते हैं उसका <b>File Code</b> भेजें।\nरद्द करने के लिए /cancel टाइप करें।"
     ];
     $cBtn = ['en' => '❌ Cancel', 'bn' => '❌ বাতিল', 'hi' => '❌ रद्द करें'];
-    sendTelegramMessage($chatId, $p[$lang] ?? $p['en'], [
+    sendOrEditTelegramMessage($chatId, $messageId, $p[$lang] ?? $p['en'], [
         'inline_keyboard' => [
             [['text' => $cBtn[$lang] ?? $cBtn['en'], 'callback_data' => 'menu_main']]
         ]
@@ -1898,7 +2018,7 @@ function handleFoldersCommand(array $user, int|string $chatId, ?int $messageId =
 /**
  * Handle /addfolder command.
  */
-function handleAddFolderCommand(array $user, int|string $chatId): void {
+function handleAddFolderCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     $lang = $user['language'] ?: 'en';
     setUserState($user['id'], 'waiting_folder_name');
     $p = [
@@ -1907,7 +2027,7 @@ function handleAddFolderCommand(array $user, int|string $chatId): void {
         'hi' => "📂 <b>नया फ़ोल्डर बनाएं</b>\n\nअपने नए फ़ोल्डर का नाम भेजें (उदा: <code>Movies</code>, <code>Anime</code>):\nरद्द करने के लिए /cancel टाइप करें।"
     ];
     $cBtn = ['en' => '❌ Cancel', 'bn' => '❌ বাতিল', 'hi' => '❌ रद्द करें'];
-    sendTelegramMessage($chatId, $p[$lang] ?? $p['en'], [
+    sendOrEditTelegramMessage($chatId, $messageId, $p[$lang] ?? $p['en'], [
         'inline_keyboard' => [
             [['text' => $cBtn[$lang] ?? $cBtn['en'], 'callback_data' => 'menu_main']]
         ]
@@ -1921,9 +2041,9 @@ function handleAddFolderCommand(array $user, int|string $chatId): void {
 /**
  * Handle /admin command.
  */
-function handleAdminCommand(array $user, int|string $chatId): void {
+function handleAdminCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     if (!isTelegramAdmin($user['telegram_user_id'])) {
-        sendTelegramMessage($chatId, "⛔ <b>Access Denied:</b> This command is restricted to administrators.");
+        sendOrEditTelegramMessage($chatId, $messageId, "⛔ <b>Access Denied:</b> This command is restricted to administrators.");
         return;
     }
 
@@ -1975,7 +2095,7 @@ function handleAdminCommand(array $user, int|string $chatId): void {
         ]
     ];
 
-    sendTelegramMessage($chatId, $text, $keyboard);
+    sendOrEditTelegramMessage($chatId, $messageId, $text, $keyboard);
 }
 
 /**
@@ -2014,7 +2134,7 @@ function handleForceSubCommand(array $user, int|string $chatId, string $args): v
 /**
  * Handle /broadcast command.
  */
-function handleBroadcastCommand(array $user, int|string $chatId): void {
+function handleBroadcastCommand(array $user, int|string $chatId, ?int $messageId = null): void {
     if (!isTelegramAdmin($user['telegram_user_id'])) return;
 
     setUserState($user['id'], 'waiting_broadcast_msg');
@@ -2023,7 +2143,7 @@ function handleBroadcastCommand(array $user, int|string $chatId): void {
           . "HTML formatting is fully supported.\n\n"
           . "Type /cancel to abort.";
 
-    sendTelegramMessage($chatId, $text, [
+    sendOrEditTelegramMessage($chatId, $messageId, $text, [
         'inline_keyboard' => [
             [['text' => '❌ Cancel', 'callback_data' => 'menu_main']]
         ]
@@ -2148,7 +2268,7 @@ function handleCallbackQuery(array $callbackQuery): void {
             'hi' => '✅ भाषा सफलतापूर्वक हिन्दी में बदल दी गई है!'
         ];
         answerCallbackQuery($callbackId, $confs[$newLang] ?? $confs['en']);
-        handleStartCommand($user, $chatId);
+        handleStartCommand($user, $chatId, $messageId);
         return;
     }
 
@@ -2156,7 +2276,7 @@ function handleCallbackQuery(array $callbackQuery): void {
     if ($data === 'check_force_sub') {
         if (checkUserSubscription($user['telegram_user_id'])) {
             answerCallbackQuery($callbackId, "✅ Membership verified!");
-            handleStartCommand($user, $chatId);
+            handleStartCommand($user, $chatId, $messageId);
         } else {
             answerCallbackQuery($callbackId, "❌ You have not joined the channel yet. Please join first!", true);
         }
@@ -2166,7 +2286,7 @@ function handleCallbackQuery(array $callbackQuery): void {
     // Check Force Subscribe for all other actions
     if (!checkUserSubscription($user['telegram_user_id'])) {
         answerCallbackQuery($callbackId, "Please join our channel first!", true);
-        sendForceSubscribeNotice($chatId, $lang);
+        sendForceSubscribeNotice($chatId, $lang, $messageId);
         return;
     }
 
@@ -2183,15 +2303,15 @@ function handleCallbackQuery(array $callbackQuery): void {
     switch (true) {
         case $data === 'menu_main':
             clearUserState($user['id']);
-            handleStartCommand($user, $chatId);
+            handleStartCommand($user, $chatId, $messageId);
             break;
 
         case $data === 'menu_language':
-            handleLanguageSelectionPrompt($chatId);
+            handleLanguageSelectionPrompt($chatId, $messageId);
             break;
 
         case $data === 'menu_upload' || $data === 'menu_remote_upload':
-            handleUploadCommand($user, $chatId);
+            handleUploadCommand($user, $chatId, $messageId);
             break;
 
         case $data === 'menu_apis':
@@ -2199,7 +2319,7 @@ function handleCallbackQuery(array $callbackQuery): void {
             break;
 
         case $data === 'api_add':
-            handleAddApiCommand($user, $chatId);
+            handleAddApiCommand($user, $chatId, $messageId);
             break;
 
         case $data === 'api_switch':
@@ -2284,18 +2404,18 @@ function handleCallbackQuery(array $callbackQuery): void {
             break;
 
         case $data === 'menu_file_info':
-            handleFileInfoCommand($user, $chatId);
+            handleFileInfoCommand($user, $chatId, null, $messageId);
             break;
 
         case str_starts_with($data, 'finfo_'):
             $code = substr($data, 6);
-            handleFileInfoCommand($user, $chatId, $code);
+            handleFileInfoCommand($user, $chatId, $code, $messageId);
             break;
 
         case str_starts_with($data, 'frename_'):
             $code = substr($data, 8);
             setUserState($user['id'], 'waiting_rename_title', ['code' => $code]);
-            sendTelegramMessage($chatId, "✏️ <b>Send new title for file:</b> <code>{$code}</code>\n<i>Type /cancel to abort</i>", [
+            editTelegramMessage($chatId, $messageId, "✏️ <b>Send new title for file:</b> <code>{$code}</code>\n<i>Type /cancel to abort</i>", [
                 'inline_keyboard' => [
                     [['text' => '❌ Cancel', 'callback_data' => 'menu_files']]
                 ]
@@ -2307,17 +2427,17 @@ function handleCallbackQuery(array $callbackQuery): void {
             break;
 
         case $data === 'folder_create':
-            handleAddFolderCommand($user, $chatId);
+            handleAddFolderCommand($user, $chatId, $messageId);
             break;
 
         case $data === 'menu_help':
-            handleHelpCommand($chatId, $lang);
+            handleHelpCommand($chatId, $lang, $messageId);
             break;
 
         case $data === 'admin_forcesub_menu':
             if (isTelegramAdmin($user['telegram_user_id'])) {
                 setUserState($user['id'], 'waiting_forcesub_channel');
-                sendTelegramMessage($chatId, "📢 <b>Set Force Subscribe Channel</b>\n\nSend the channel username (e.g. <code>@MyChannel</code>) or type <code>off</code> to disable force subscribe:\nType /cancel to abort.", [
+                editTelegramMessage($chatId, $messageId, "📢 <b>Set Force Subscribe Channel</b>\n\nSend the channel username (e.g. <code>@MyChannel</code>) or type <code>off</code> to disable force subscribe:\nType /cancel to abort.", [
                     'inline_keyboard' => [
                         [['text' => '❌ Cancel', 'callback_data' => 'menu_main']]
                     ]
@@ -2326,7 +2446,7 @@ function handleCallbackQuery(array $callbackQuery): void {
             break;
 
         case $data === 'admin_broadcast':
-            handleBroadcastCommand($user, $chatId);
+            handleBroadcastCommand($user, $chatId, $messageId);
             break;
 
         case $data === 'admin_toggle_maint':
@@ -2334,7 +2454,7 @@ function handleCallbackQuery(array $callbackQuery): void {
                 $current = getBotSetting('maintenance_mode', '0');
                 $new = ($current === '1') ? '0' : '1';
                 setBotSetting('maintenance_mode', $new);
-                handleAdminCommand($user, $chatId);
+                handleAdminCommand($user, $chatId, $messageId);
             }
             break;
 
@@ -2418,8 +2538,8 @@ function handleMessage(array $message): void {
         return;
     }
 
-    // Check Direct Media Uploads (video or document)
-    if (!empty($message['video']) || !empty($message['document'])) {
+    // Check Direct Media Uploads (video, document, animation, or forwarded video)
+    if (!empty($message['video']) || !empty($message['document']) || !empty($message['animation'])) {
         handleDirectTelegramUpload($user, $chatId, $message);
         return;
     }
