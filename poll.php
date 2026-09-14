@@ -50,6 +50,6 @@ while (true) {
         }
     }
 
-    // Short sleep between long-polling cycles
-    usleep(250000);
+    // Minimal 10ms pause between polling cycles for ultra-fast response
+    usleep(10000);
 }
